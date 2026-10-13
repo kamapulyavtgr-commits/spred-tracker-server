@@ -86,6 +86,20 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
+// Keep-alive: внешний пинг раз в несколько минут держит бодрыми
+// и Render (не засыпает после 15 минут), и Supabase (не уходит
+// на паузу после 7 дней простоя — для этого нужен запрос именно к БД).
+// Кода доступа не требует: наружу ничего не отдаёт.
+app.get('/api/ping', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT COUNT(*)::int AS n FROM deals');
+    res.json({ ok: true, deals: r.rows[0].n, at: new Date().toISOString() });
+  } catch (e) {
+    console.error('Ping: база недоступна:', e.message);
+    res.status(503).json({ ok: false, error: 'db unavailable' });
+  }
+});
+
 // Проверка кода при входе — возвращает роль, без выдачи данных
 app.get('/api/auth', checkAccess, (req, res) => {
   res.json({ role: req.role });
