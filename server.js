@@ -17,6 +17,14 @@ const TG_SECRET      = process.env.TG_SECRET;      // произвольная �
 // id чатов, которым бот отвечает, через запятую. Пока пусто — отвечает только на /chatid.
 const ALLOWED_CHATS  = (process.env.ALLOWED_CHATS || '')
   .split(',').map(x => x.trim()).filter(Boolean);
+// Telegram id тех, кому можно добавлять сделки. Проверка идёт по человеку,
+// а не по чату: в общей группе /add сработает только у перечисленных здесь.
+const ADMIN_USERS    = (process.env.ADMIN_USERS || '')
+  .split(',').map(x => x.trim()).filter(Boolean);
+// Куда слать автоотчёт и уведомления о новых сделках (обычно id общей группы)
+const REPORT_CHAT    = (process.env.REPORT_CHAT || '').trim();
+// NOTIFY_NEW_DEAL=off выключает уведомления о каждой новой сделке
+const NOTIFY_NEW_DEAL = (process.env.NOTIFY_NEW_DEAL || '').toLowerCase() !== 'off';
 
 if (!ADMIN_CODE || !VIEW_CODE) {
   console.warn('ВНИМАНИЕ: задайте переменные окружения ADMIN_CODE и VIEW_CODE в настройках сервиса на Render.');
@@ -172,6 +180,14 @@ app.post('/api/deals', checkAccess, async (req, res) => {
       ]
     );
     res.json({ ok: true });
+
+    // сообщаем команде о новой сделке (ответ уже отправлен, мини-апп не ждёт)
+    if (dealScope === 'team') {
+      notifyNewDeal(
+        { date, amount, rate_in: rateIn, rate_out: rateOut, kickback_pct: kickbackPct || 0 },
+        createdBy || null
+      ).catch(e => console.error('Уведомление о сделке:', e.message));
+    }
   } catch (e) {
     console.error('Ошибка сохранения сделки:', e);
     res.status(500).json({ error: 'Ошибка базы данных' });
@@ -295,10 +311,52 @@ const HELP =
   '/week — за последние 7 дней\n' +
   '/month — за текущий месяц\n' +
   '/last — последняя сделка\n' +
-  '/rate — курс USDT/RUB на бирже\n' +
+  '/rate — курс USDT/RUB на бирже\n\n' +
+  '<b>Расчёт</b>\n' +
+  '/calc сумма курс_входа курс_выхода — прикинуть профит без сохранения\n' +
+  '<i>например: /calc 7800000 81.2 82.3</i>\n' +
+  '/add сумма курс_входа курс_выхода — записать сделку <i>(только владелец)</i>\n\n' +
   '/chatid — id этого чата';
 
-async function handleCommand(chatId, cmd) {
+// «81,2» и «7 800 000» тоже понимаем
+function parseNum(str) {
+  const n = parseFloat(String(str).replace(/\s|_/g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : NaN;
+}
+
+// Разбор аргументов /calc и /add: сумма, курс входа, курс выхода, [кикбек %]
+function parseDealArgs(args) {
+  const amount  = parseNum(args[0]);
+  const rateIn  = parseNum(args[1]);
+  const rateOut = parseNum(args[2]);
+  const kick    = args[3] !== undefined ? parseNum(args[3]) : 0.4;
+
+  if (!amount || !rateIn || !rateOut) return { error: 'Нужны три числа: сумма, курс входа, курс выхода.' };
+  if (amount <= 0 || rateIn <= 0 || rateOut <= 0) return { error: 'Числа должны быть больше нуля.' };
+  if (!Number.isFinite(kick) || kick < 0) return { error: 'Кикбек указан неверно.' };
+  return { amount, rateIn, rateOut, kick };
+}
+
+function dealBreakdown(d) {
+  const c = computeDeal(d);
+  return `Вход: ${money(d.amount)} по ${d.rate_in.toFixed(2)}\n` +
+         `Куплено: ${c.usdt.toLocaleString('ru-RU', { maximumFractionDigits: 2 })} USDT\n` +
+         `Выход: по ${d.rate_out.toFixed(2)} \u2192 ${money(c.amountOut)}\n\n` +
+         `Спред: ${money(c.profit)}\n` +
+         `Кикбек (${d.kickback_pct}%): ${money(c.kickback)}\n` +
+         `<b>Итого: ${money(c.totalToShare)}</b> (${pctFmt(c.totalPct)})\n` +
+         `На человека: <b>${money(c.perPerson)}</b>`;
+}
+
+// Сообщение в общий чат о только что добавленной сделке
+async function notifyNewDeal(d, author) {
+  if (!NOTIFY_NEW_DEAL || !REPORT_CHAT) return;
+  await tgSend(REPORT_CHAT,
+    `\u2795 <b>Новая сделка</b>${author ? ' · ' + author : ''}\n` +
+    `${d.date.split('-').reverse().join('.')}\n\n` + dealBreakdown(d));
+}
+
+async function handleCommand(chatId, cmd, args, userId) {
   switch (cmd) {
     case '/start':
     case '/help':
@@ -350,6 +408,39 @@ async function handleCommand(chatId, cmd) {
       }
     }
 
+    case '/calc': {
+      const a = parseDealArgs(args);
+      if (a.error) {
+        return tgSend(chatId, a.error + '\n\nПример: <code>/calc 7800000 81.2 82.3</code>');
+      }
+      const d = { amount: a.amount, rate_in: a.rateIn, rate_out: a.rateOut, kickback_pct: a.kick };
+      return tgSend(chatId, '<b>Расчёт</b> <i>(не сохранён)</i>\n\n' + dealBreakdown(d));
+    }
+
+    case '/add': {
+      if (!ADMIN_USERS.includes(String(userId))) {
+        return tgSend(chatId, 'Добавлять сделки может только владелец трекера.');
+      }
+      const a = parseDealArgs(args);
+      if (a.error) {
+        return tgSend(chatId, a.error + '\n\nПример: <code>/add 7800000 81.2 82.3</code>');
+      }
+
+      const date = mskToday();
+      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      await pool.query(
+        `INSERT INTO deals (id, date, amount, rate_in, rate_out, kickback_pct, created_by, scope, owner_id, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'team', NULL, $8)`,
+        [id, date, a.amount, a.rateIn, a.rateOut, a.kick, 'telegram', Date.now()]
+      );
+
+      const d = { date, amount: a.amount, rate_in: a.rateIn, rate_out: a.rateOut, kickback_pct: a.kick };
+      await tgSend(chatId, '\u2705 <b>Сделка добавлена</b>\n\n' + dealBreakdown(d));
+      // в общий чат — только если команду писали не в нём самом
+      if (REPORT_CHAT && REPORT_CHAT !== chatId) await notifyNewDeal(d, null);
+      return;
+    }
+
     default:
       return tgSend(chatId, 'Не знаю такую команду. /help — список.');
   }
@@ -368,7 +459,10 @@ app.post('/api/tg', async (req, res) => {
 
     const chatId = String(msg.chat.id);
     // в группе команда может прийти как /today@MyBot — отрезаем имя бота
-    const cmd = msg.text.trim().split(/\s+/)[0].split('@')[0].toLowerCase();
+    const parts = msg.text.trim().split(/\s+/);
+    const cmd = parts[0].split('@')[0].toLowerCase();
+    const args = parts.slice(1);
+    const userId = msg.from ? msg.from.id : null;
     if (!cmd.startsWith('/')) return;
 
     // /chatid работает везде — чтобы узнать id и внести его в ALLOWED_CHATS
@@ -383,9 +477,32 @@ app.post('/api/tg', async (req, res) => {
       return tgSend(chatId, 'Бот ещё не настроен: задайте ALLOWED_CHATS на сервере. /chatid покажет id.');
     }
 
-    await handleCommand(chatId, cmd);
+    await handleCommand(chatId, cmd, args, userId);
   } catch (e) {
     console.error('Ошибка обработки апдейта:', e);
+  }
+});
+
+// Итоги дня. Вызывается извне по расписанию (cron-job.org) в конце дня.
+// Защищён тем же секретом, что и вебхук. Если сделок не было — молчит,
+// чтобы не засорять чат ежедневным «сделок нет».
+app.get('/api/report/daily', async (req, res) => {
+  if (TG_SECRET && req.query.key !== TG_SECRET) return res.sendStatus(401);
+  if (!REPORT_CHAT) return res.json({ ok: false, error: 'REPORT_CHAT не задан' });
+
+  try {
+    const day = mskToday();
+    const rows = await dealsBetween(day, day);
+    if (rows.length === 0) return res.json({ ok: true, skipped: 'сделок нет' });
+
+    await tgSend(REPORT_CHAT,
+      '\uD83C\uDF19 <b>Итоги дня</b>\n\n' +
+      summary(day.split('-').reverse().join('.'), rows).split('\n').slice(2).join('\n'));
+
+    res.json({ ok: true, deals: rows.length });
+  } catch (e) {
+    console.error('Автоотчёт:', e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
