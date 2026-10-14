@@ -11,6 +11,13 @@ const ADMIN_CODE = process.env.ADMIN_CODE;     // полный доступ — 
 const VIEW_CODE = process.env.VIEW_CODE;       // только просмотр — у команды
 const DATABASE_URL = process.env.DATABASE_URL; // строка подключения Supabase
 
+// --- Телеграм-бот (команды в чате команды) ---
+const BOT_TOKEN      = process.env.BOT_TOKEN;      // токен от @BotFather
+const TG_SECRET      = process.env.TG_SECRET;      // произвольная строка, защищает вебхук
+// id чатов, которым бот отвечает, через запятую. Пока пусто — отвечает только на /chatid.
+const ALLOWED_CHATS  = (process.env.ALLOWED_CHATS || '')
+  .split(',').map(x => x.trim()).filter(Boolean);
+
 if (!ADMIN_CODE || !VIEW_CODE) {
   console.warn('ВНИМАНИЕ: задайте переменные окружения ADMIN_CODE и VIEW_CODE в настройках сервиса на Render.');
 }
@@ -192,6 +199,193 @@ app.delete('/api/deals/:id', checkAccess, async (req, res) => {
   } catch (e) {
     console.error('Ошибка удаления сделки:', e);
     res.status(500).json({ error: 'Ошибка базы данных' });
+  }
+});
+
+
+// ======================= ТЕЛЕГРАМ-БОТ =======================
+
+const money = n => new Intl.NumberFormat('ru-RU', {
+  minimumFractionDigits: 2, maximumFractionDigits: 2
+}).format(Math.round(n * 100) / 100) + ' \u20BD';
+
+const pctFmt = n => new Intl.NumberFormat('ru-RU', {
+  minimumFractionDigits: 2, maximumFractionDigits: 2
+}).format(n * 100) + '%';
+
+// Та же формула, что и в мини-аппе: кикбек Рауля возвращается в общий котёл,
+// итог делится на четверых поровну.
+function computeDeal(d) {
+  const usdt         = d.amount / d.rate_in;
+  const amountOut    = usdt * d.rate_out;
+  const profit       = amountOut - d.amount;
+  const kickback     = d.amount * ((d.kickback_pct || 0) / 100);
+  const totalToShare = profit + kickback;
+  return {
+    usdt, amountOut, profit, kickback, totalToShare,
+    totalPct: totalToShare / d.amount,
+    perPerson: totalToShare / 4
+  };
+}
+
+// Даты в часовом поясе Москвы — чтобы «сегодня» совпадало с тем, что видит команда
+function mskToday() {
+  return new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+}
+function mskDaysAgo(n) {
+  return new Date(Date.now() + 3 * 3600 * 1000 - n * 86400000).toISOString().slice(0, 10);
+}
+
+async function dealsBetween(from, to) {
+  const r = await pool.query(
+    'SELECT * FROM deals WHERE date >= $1 AND date <= $2 ORDER BY date, created_at',
+    [from, to]
+  );
+  return r.rows;
+}
+
+// Сводка за период одним сообщением
+function summary(title, rows) {
+  if (rows.length === 0) return `<b>${title}</b>\n\nСделок нет.`;
+
+  const c = rows.map(computeDeal);
+  const total   = c.reduce((s, x) => s + x.totalToShare, 0);
+  const avgPct  = c.reduce((s, x) => s + x.totalPct, 0) / c.length;
+  const buyRub  = rows.reduce((s, d) => s + Number(d.amount), 0);
+  const usdtVol = c.reduce((s, x) => s + x.usdt, 0);
+  const share   = total / 4;
+
+  return `<b>${title}</b>\n\n` +
+    `Профит: <b>${money(total)}</b>  (${pctFmt(avgPct)})\n` +
+    `На человека: <b>${money(share)}</b>\n` +
+    `Сделок: ${rows.length}\n` +
+    `Оборот: ${money(buyRub)} · ${usdtVol.toLocaleString('ru-RU', { maximumFractionDigits: 2 })} USDT`;
+}
+
+// Курс USDT/RUB с биржи Rapira (публичный API, без ключей)
+async function fetchRate() {
+  const res = await fetch('https://api.rapira.net/open/market/rates', { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error('rapira ' + res.status);
+  const json = await res.json();
+  const item = (json.data || []).find(x => x.symbol === 'USDT/RUB');
+  if (!item) throw new Error('пара USDT/RUB не найдена');
+  return item;
+}
+
+async function tgSend(chatId, text) {
+  if (!BOT_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId, text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+      })
+    });
+  } catch (e) {
+    console.error('Telegram sendMessage:', e.message);
+  }
+}
+
+const HELP =
+  '<b>Команды трекера</b>\n\n' +
+  '/today — профит за сегодня\n' +
+  '/week — за последние 7 дней\n' +
+  '/month — за текущий месяц\n' +
+  '/last — последняя сделка\n' +
+  '/rate — курс USDT/RUB на бирже\n' +
+  '/chatid — id этого чата';
+
+async function handleCommand(chatId, cmd) {
+  switch (cmd) {
+    case '/start':
+    case '/help':
+      return tgSend(chatId, HELP);
+
+    case '/today': {
+      const d = mskToday();
+      const rows = await dealsBetween(d, d);
+      return tgSend(chatId, summary('Сегодня, ' + d.split('-').reverse().join('.'), rows));
+    }
+
+    case '/week': {
+      const from = mskDaysAgo(6), to = mskToday();
+      const rows = await dealsBetween(from, to);
+      const label = from.split('-').reverse().join('.') + ' — ' + to.split('-').reverse().join('.');
+      return tgSend(chatId, summary('Последние 7 дней (' + label + ')', rows));
+    }
+
+    case '/month': {
+      const to = mskToday(), from = to.slice(0, 7) + '-01';
+      const rows = await dealsBetween(from, to);
+      return tgSend(chatId, summary('Текущий месяц', rows));
+    }
+
+    case '/last': {
+      const r = await pool.query('SELECT * FROM deals ORDER BY date DESC, created_at DESC LIMIT 1');
+      if (!r.rows.length) return tgSend(chatId, 'Сделок пока нет.');
+      const d = r.rows[0], c = computeDeal(d);
+      return tgSend(chatId,
+        `<b>Последняя сделка</b>\n\n` +
+        `Дата: ${d.date.split('-').reverse().join('.')}\n` +
+        `Вход: ${money(Number(d.amount))} по ${Number(d.rate_in).toFixed(2)}\n` +
+        `Выход: по ${Number(d.rate_out).toFixed(2)}\n` +
+        `Профит: <b>${money(c.totalToShare)}</b> (${pctFmt(c.totalPct)})\n` +
+        `На человека: ${money(c.perPerson)}`);
+    }
+
+    case '/rate': {
+      try {
+        const it = await fetchRate();
+        return tgSend(chatId,
+          `<b>USDT/RUB · Rapira</b>\n\n` +
+          `Текущий: <b>${Number(it.close).toFixed(2)} \u20BD</b>\n` +
+          `Покупка: ${Number(it.bidPrice).toFixed(2)} · Продажа: ${Number(it.askPrice).toFixed(2)}\n` +
+          `За сутки: ${Number(it.chg) >= 0 ? '+' : ''}${(Number(it.chg) * 100).toFixed(2)}%\n\n` +
+          `<i>Биржевой курс, не курс вашей площадки.</i>`);
+      } catch (e) {
+        return tgSend(chatId, 'Не удалось получить курс: ' + e.message);
+      }
+    }
+
+    default:
+      return tgSend(chatId, 'Не знаю такую команду. /help — список.');
+  }
+}
+
+// Вебхук Telegram. Секрет приходит заголовком, который Telegram ставит сам.
+app.post('/api/tg', async (req, res) => {
+  if (TG_SECRET && req.get('X-Telegram-Bot-Api-Secret-Token') !== TG_SECRET) {
+    return res.sendStatus(401);
+  }
+  res.json({ ok: true });            // отвечаем сразу, обрабатываем после
+
+  try {
+    const msg = req.body.message || req.body.channel_post;
+    if (!msg || !msg.text) return;
+
+    const chatId = String(msg.chat.id);
+    // в группе команда может прийти как /today@MyBot — отрезаем имя бота
+    const cmd = msg.text.trim().split(/\s+/)[0].split('@')[0].toLowerCase();
+    if (!cmd.startsWith('/')) return;
+
+    // /chatid работает везде — чтобы узнать id и внести его в ALLOWED_CHATS
+    if (cmd === '/chatid') {
+      return tgSend(chatId, `id этого чата: <code>${chatId}</code>`);
+    }
+
+    if (ALLOWED_CHATS.length && !ALLOWED_CHATS.includes(chatId)) {
+      return tgSend(chatId, 'Этот чат не в списке разрешённых.');
+    }
+    if (!ALLOWED_CHATS.length) {
+      return tgSend(chatId, 'Бот ещё не настроен: задайте ALLOWED_CHATS на сервере. /chatid покажет id.');
+    }
+
+    await handleCommand(chatId, cmd);
+  } catch (e) {
+    console.error('Ошибка обработки апдейта:', e);
   }
 });
 
